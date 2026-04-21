@@ -1,0 +1,25 @@
+{
+  "name": "concode",
+  "version": "0.1.0",
+  "description": "Debate-driven AI proxy server — two models argue, a judge decides, you get better answers.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["ai", "claude", "debate", "proxy", "docker"],
+  "author": "Neo-romanticism",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.39.0",
+    "express": "4.21.2",
+    "zod": "3.24.2"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.1",
+    "@types/node": "22.13.10",
+    "tsx": "4.19.3",
+    "typescript": "5.8.2"
+  }
+}
