@@ -8,11 +8,18 @@
     "build": "tsc",
     "start": "node dist/index.js"
   },
-  "keywords": ["ai", "claude", "debate", "proxy", "docker"],
+  "keywords": [
+    "ai",
+    "claude",
+    "debate",
+    "proxy",
+    "docker"
+  ],
   "author": "Neo-romanticism",
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "0.39.0",
+    "dotenv": "^16.4.7",
     "express": "4.21.2",
     "zod": "3.24.2"
   },

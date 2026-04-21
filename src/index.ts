@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import chatRouter from "./routes/chat.js";
 import { SERVER_PORT } from "./config.js";

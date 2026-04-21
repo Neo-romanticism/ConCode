@@ -29,13 +29,18 @@ const ChatRequestSchema = z.object({
  */
 router.post("/v1/chat/completions", async (req: Request, res: Response) => {
   try {
-    // Extract API key from Authorization header
+    // API key: header takes priority, falls back to .env
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith("Bearer ")) {
-      res.status(401).json({ error: "Missing or invalid Authorization header. Use: Bearer <your-api-key>" });
+    const apiKey = authHeader?.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : process.env.ANTHROPIC_API_KEY;
+
+    if (!apiKey) {
+      res.status(401).json({
+        error: "No API key found. Set ANTHROPIC_API_KEY in .env or pass Authorization: Bearer <key>",
+      });
       return;
     }
-    const apiKey = authHeader.slice(7);
 
     // Parse and validate request body
     const parsed = ChatRequestSchema.safeParse(req.body);
