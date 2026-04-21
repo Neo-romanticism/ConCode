@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { getClient } from "../utils/anthropic.js";
-import { summonJudgeTool } from "./tools.js";
+import { allTools } from "./tools.js";
+import { executeTool } from "./fileops.js";
 import { RequestConfig } from "../config.js";
 
 export interface DebateResult {
@@ -9,55 +10,44 @@ export interface DebateResult {
   rounds: number;
 }
 
-interface DebateMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
 /**
  * Run the debate loop between advocate (Model 1) and critic (Model 2).
  *
  * Flow:
- * 1. Advocate generates an initial answer to the user's prompt.
+ * 1. Advocate generates an initial answer (may use file tools).
  * 2. Critic reviews the advocate's answer (without seeing the original user prompt).
- * 3. Advocate responds to criticism, optionally calling summon_judge if consensus is reached.
+ * 3. Advocate responds to criticism, may use file tools, calls summon_judge on consensus.
  * 4. Repeat until summon_judge is called or max_rounds is hit.
  */
 export async function runDebate(
   apiKey: string,
   userMessages: Anthropic.MessageParam[],
   systemPrompt: string | undefined,
-  config: RequestConfig
+  config: RequestConfig,
+  onToolUse?: (name: string, input: Record<string, string>) => void
 ): Promise<DebateResult> {
   const client = getClient(apiKey);
 
-  // --- Step 1: Advocate generates initial answer ---
   const advocateSystem =
     `You are the Advocate. Your job is to provide the best possible answer to the user's request.\n` +
+    `You have tools: file ops (read/write/edit/delete/move/copy), directory (list/tree/info), search (grep), shell execution, and web (fetch/search).\n` +
     `You will engage in a debate with a Critic who will challenge your answer.\n` +
     `When you and the Critic reach consensus, call the summon_judge tool with the final agreed answer.\n` +
     `Stay focused and constructive. Incorporate valid criticism to improve your answer.\n` +
     (systemPrompt ? `\nOriginal system context: ${systemPrompt}` : "");
 
-  const advocateHistory: DebateMessage[] = [];
-  const criticHistory: DebateMessage[] = [];
+  const advocateMessages: Anthropic.MessageParam[] = [...userMessages];
+  const criticMessages: Anthropic.MessageParam[] = [];
 
-  // Get initial answer from advocate
-  const initialResponse = await client.messages.create({
-    model: config.model_advocate,
-    max_tokens: 8192,
-    system: advocateSystem,
-    tools: [summonJudgeTool],
-    messages: userMessages,
-  });
-
-  const initialAnswer = extractText(initialResponse);
-  advocateHistory.push(
-    { role: "user", content: userMessages.map(m => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n") },
-    { role: "assistant", content: initialAnswer }
+  // Get initial answer from advocate (with tool loop)
+  const initialAnswer = await callAdvocateWithTools(
+    client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse
   );
 
-  // --- Debate loop ---
+  if (typeof initialAnswer !== "string") {
+    return { ...initialAnswer, rounds: 0 };
+  }
+
   let currentAnswer = initialAnswer;
 
   for (let round = 1; round <= config.max_rounds; round++) {
@@ -72,53 +62,37 @@ export async function runDebate(
       `Here is the answer to review:\n\n${currentAnswer}\n\n` +
       `Provide your critique. Be specific about what could be improved.`;
 
-    criticHistory.push({ role: "user", content: criticPrompt });
+    criticMessages.push({ role: "user", content: criticPrompt });
 
     const criticResponse = await client.messages.create({
       model: config.model_critic,
       max_tokens: 4096,
       system: criticSystem,
-      messages: criticHistory.map(m => ({ role: m.role, content: m.content })),
+      messages: criticMessages,
     });
 
     const criticism = extractText(criticResponse);
-    criticHistory.push({ role: "assistant", content: criticism });
+    criticMessages.push({ role: "assistant", content: criticism });
 
-    // --- Advocate's turn: respond to criticism ---
+    // --- Advocate's turn ---
     const advocatePrompt =
       `A critic has reviewed your answer and provided this feedback:\n\n${criticism}\n\n` +
       `Revise your answer incorporating valid points, or defend your position if the criticism is unfounded.\n` +
-      `If you believe the answer is now strong enough and addresses all valid concerns, call the summon_judge tool.`;
+      `You may use file tools if needed. If you believe the answer is now strong enough, call the summon_judge tool.`;
 
-    advocateHistory.push({ role: "user", content: advocatePrompt });
+    advocateMessages.push({ role: "user", content: advocatePrompt });
 
-    const advocateResponse = await client.messages.create({
-      model: config.model_advocate,
-      max_tokens: 8192,
-      system: advocateSystem,
-      tools: [summonJudgeTool],
-      messages: advocateHistory.map(m => ({ role: m.role, content: m.content })),
-    });
+    const advocateAnswer = await callAdvocateWithTools(
+      client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse
+    );
 
-    // Check if advocate called summon_judge
-    const toolUse = findToolUse(advocateResponse);
-    if (toolUse) {
-      const input = toolUse.input as {
-        consensus_answer: string;
-        key_improvements: string;
-      };
-      return {
-        consensusAnswer: input.consensus_answer,
-        keyImprovements: input.key_improvements,
-        rounds: round,
-      };
+    if (typeof advocateAnswer !== "string") {
+      return { ...advocateAnswer, rounds: round };
     }
 
-    currentAnswer = extractText(advocateResponse);
-    advocateHistory.push({ role: "assistant", content: currentAnswer });
+    currentAnswer = advocateAnswer;
   }
 
-  // Max rounds reached — force a result with the latest answer
   return {
     consensusAnswer: currentAnswer,
     keyImprovements: "Max debate rounds reached. Returning best available answer.",
@@ -126,18 +100,90 @@ export async function runDebate(
   };
 }
 
+/**
+ * Call the advocate model, handling file tool calls in a loop
+ * until we get a text response or a summon_judge call.
+ */
+async function callAdvocateWithTools(
+  client: Anthropic,
+  model: string,
+  system: string,
+  tools: Anthropic.Tool[],
+  messages: Anthropic.MessageParam[],
+  onToolUse?: (name: string, input: Record<string, string>) => void
+): Promise<string | { consensusAnswer: string; keyImprovements: string }> {
+  const maxToolRounds = 20;
+
+  for (let i = 0; i < maxToolRounds; i++) {
+    const response = await client.messages.create({
+      model,
+      max_tokens: 8192,
+      system,
+      tools,
+      messages,
+    });
+
+    // Check for summon_judge
+    const judgeCall = response.content.find(
+      (b): b is Anthropic.ToolUseBlock =>
+        b.type === "tool_use" && b.name === "summon_judge"
+    );
+
+    if (judgeCall) {
+      const input = judgeCall.input as {
+        consensus_answer: string;
+        key_improvements: string;
+      };
+      return {
+        consensusAnswer: input.consensus_answer,
+        keyImprovements: input.key_improvements,
+      };
+    }
+
+    // Check for file tool calls
+    const toolCalls = response.content.filter(
+      (b): b is Anthropic.ToolUseBlock =>
+        b.type === "tool_use" && b.name !== "summon_judge"
+    );
+
+    if (toolCalls.length === 0) {
+      // No tool calls — return text
+      const text = extractText(response);
+      messages.push({ role: "assistant", content: response.content });
+      return text;
+    }
+
+    // Execute file tools and feed results back
+    messages.push({ role: "assistant", content: response.content });
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+    for (const call of toolCalls) {
+      const input = call.input as Record<string, string>;
+      onToolUse?.(call.name, input);
+
+      let result: string;
+      try {
+        result = await executeTool(call.name, input);
+      } catch (err) {
+        result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: call.id,
+        content: result,
+      });
+    }
+
+    messages.push({ role: "user", content: toolResults });
+  }
+
+  return "Max tool rounds exceeded.";
+}
+
 function extractText(response: Anthropic.Message): string {
   return response.content
     .filter((block): block is Anthropic.TextBlock => block.type === "text")
     .map((block) => block.text)
     .join("\n");
-}
-
-function findToolUse(
-  response: Anthropic.Message
-): Anthropic.ToolUseBlock | undefined {
-  return response.content.find(
-    (block): block is Anthropic.ToolUseBlock =>
-      block.type === "tool_use" && block.name === "summon_judge"
-  );
 }

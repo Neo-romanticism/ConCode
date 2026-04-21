@@ -42,7 +42,10 @@ function prompt() {
       process.stdout.write("\n⏳ Debating...\n");
 
       const userMessages = [{ role: "user" as const, content: trimmed }];
-      const debateResult = await runDebate(apiKey, userMessages, undefined, config);
+      const debateResult = await runDebate(apiKey, userMessages, undefined, config, (name, input) => {
+        const detail = input.path ?? input.command ?? input.query ?? input.url ?? input.pattern ?? "";
+        process.stdout.write(`  🔧 ${name}${detail ? `: ${detail}` : ""}\n`);
+      });
 
       process.stdout.write(`✅ Consensus after ${debateResult.rounds} round(s)\n\n`);
 
