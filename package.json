@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Debate-driven AI proxy server — two models argue, a judge decides, you get better answers.",
   "main": "dist/index.js",
+  "bin": {
+    "concode": "dist/bin/concode.js"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",

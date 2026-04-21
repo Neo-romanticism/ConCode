@@ -1,92 +1,120 @@
 # concode
 
-Debate-driven AI proxy server. Two models argue, a judge decides, you get better answers.
+두 AI가 토론하고, 판사가 결론 내리는 프록시 서버 & CLI.
 
-## How it works
+## 원리
 
 ```
-User Request
+사용자 요청
      │
      ▼
-┌─────────┐    critique    ┌─────────┐
-│ Model 1  │◄─────────────►│ Model 2  │
-│ Advocate │   rebuttal    │  Critic  │
-└────┬─────┘               └──────────┘
-     │ consensus reached (tool call)
-     ▼
-┌─────────┐
-│ Model 3  │──► Streamed Response
-│  Judge   │
-└──────────┘
+┌──────────┐   비판    ┌──────────┐
+│  Model 1  │◄────────►│  Model 2  │
+│  Advocate │  반박    │  Critic   │
+└─────┬─────┘          └───────────┘
+      │ 합의 → summon_judge tool call
+      ▼
+┌──────────┐
+│  Model 3  │──► 스트리밍 응답
+│   Judge   │
+└───────────┘
 ```
 
-1. **Advocate** (Model 1) generates an answer to your prompt
-2. **Critic** (Model 2) reviews the answer *without seeing your original prompt* and finds flaws
-3. They go back and forth until consensus — the Advocate calls `summon_judge` via tool use
-4. **Judge** (Model 3) produces the final polished response, streamed to you
+Advocate는 14개 tool(파일 읽기/쓰기/수정/삭제, 셸 실행, 웹 검색 등)을 사용할 수 있어서
+코드를 직접 읽고 수정하는 것도 가능합니다.
 
-## Quick Start
+## 시작하기
 
-### Docker (recommended)
+```bash
+# 1. 설치
+npm install
+
+# 2. API 키 설정
+cp .env.example .env
+# .env 파일 열어서 ANTHROPIC_API_KEY 입력
+
+# 3. 실행
+npm run chat
+```
+
+끝. 이게 전부입니다.
+
+## CLI 사용 예시
+
+```
+🧠 concode — debate-driven AI
+   Advocate: claude-sonnet-4-20250514
+   Critic:   claude-sonnet-4-20250514
+   Judge:    claude-sonnet-4-20250514
+
+You > 양자 얽힘 설명해줘
+⏳ Debating...
+✅ Consensus after 3 round(s)
+(스트리밍 응답)
+
+You > src/index.ts 읽어서 포트 8080으로 바꿔줘
+⏳ Debating...
+  🔧 read_file: src/index.ts
+  🔧 edit_file: src/index.ts
+✅ Consensus after 2 round(s)
+(스트리밍 응답)
+
+You > npm run build 실행해봐
+⏳ Debating...
+  🔧 run_shell: npm run build
+✅ Consensus after 1 round(s)
+(스트리밍 응답)
+
+You > exit
+👋
+```
+
+## API 서버로 쓰기
+
+```bash
+# 서버 시작
+npm run build
+npm start
+
+# 요청 (OpenAI 호환)
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "안녕"}]}'
+```
+
+API 키는 `.env`에서 읽습니다. 헤더로 다른 키를 보내면 오버라이드 가능:
+`Authorization: Bearer sk-ant-...`
+
+## 설정
+
+`.env` 파일 또는 요청 body의 `concode` 필드로 설정:
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `ANTHROPIC_API_KEY` | — | Anthropic API 키 |
+| `MODEL_ADVOCATE` | `claude-sonnet-4-20250514` | 답변 생성 모델 |
+| `MODEL_CRITIC` | `claude-sonnet-4-20250514` | 비판 모델 |
+| `MODEL_JUDGE` | `claude-sonnet-4-20250514` | 최종 판정 모델 |
+| `MAX_ROUNDS` | `5` | 최대 토론 라운드 (1-20) |
+| `PORT` | `3000` | 서버 포트 |
+
+## Docker
+
+가상화가 지원되는 환경에서:
 
 ```bash
 docker compose up --build
 ```
 
-### Local
+## 사용 가능한 도구 (Advocate)
 
-```bash
-npm install
-npm run dev
-```
-
-## Usage
-
-concode exposes an **OpenAI-compatible** API. Use it as a drop-in replacement:
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_ANTHROPIC_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "Explain quantum entanglement"}
-    ],
-    "stream": true,
-    "concode": {
-      "model_advocate": "claude-sonnet-4-20250514",
-      "model_critic": "claude-sonnet-4-20250514",
-      "model_judge": "claude-sonnet-4-20250514",
-      "max_rounds": 5
-    }
-  }'
-```
-
-### Configuration
-
-Pass concode-specific settings in the `concode` field:
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `model_advocate` | `claude-sonnet-4-20250514` | Model for generating answers |
-| `model_critic` | `claude-sonnet-4-20250514` | Model for critiquing answers |
-| `model_judge` | `claude-sonnet-4-20250514` | Model for final output |
-| `max_rounds` | `5` | Max debate rounds (1-20) |
-
-You can mix and match models — use a cheaper model for the critic and a stronger one for the judge, for example.
-
-## API
-
-### `POST /v1/chat/completions`
-
-OpenAI-compatible chat completions endpoint. Responses are streamed as SSE.
-
-**Headers:**
-- `Authorization: Bearer <your-anthropic-api-key>`
-
-### `GET /health`
-
-Health check endpoint.
+| 카테고리 | 도구 |
+|---------|------|
+| 파일 | `read_file` `write_file` `edit_file` `delete_file` `move_file` `copy_file` |
+| 디렉토리 | `list_files` `directory_tree` `file_info` |
+| 검색 | `grep_search` |
+| 셸 | `run_shell` |
+| 웹 | `web_fetch` `web_search` |
 
 ## License
 
