@@ -38,8 +38,8 @@ export async function* judgeStream(
 
   const stream = client.messages.stream({
     model,
-    max_tokens: 8192,
-    system: judgeSystem,
+    max_tokens: 128000,
+    system: [{ type: "text", text: judgeSystem, cache_control: { type: "ephemeral" } }],
     messages,
   });
 

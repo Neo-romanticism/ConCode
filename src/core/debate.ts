@@ -10,38 +10,74 @@ export interface DebateResult {
   rounds: number;
 }
 
-/**
- * Run the debate loop between advocate (Model 1) and critic (Model 2).
- *
- * Flow:
- * 1. Advocate generates an initial answer (may use file tools).
- * 2. Critic reviews the advocate's answer (without seeing the original user prompt).
- * 3. Advocate responds to criticism, may use file tools, calls summon_judge on consensus.
- * 4. Repeat until summon_judge is called or max_rounds is hit.
- */
+/** Wrap system prompt as cacheable text block */
+function cachedSystem(text: string): Anthropic.TextBlockParam[] {
+  return [{ type: "text", text, cache_control: { type: "ephemeral" } }];
+}
+
+/** Retry wrapper for rate limit (429) errors */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3,
+  onRetry?: (attempt: number, waitMs: number) => void
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const isRateLimit =
+        err instanceof Error &&
+        (err.message.includes("429") || err.message.includes("rate_limit"));
+
+      if (!isRateLimit || attempt === maxRetries) throw err;
+
+      // Exponential backoff: 15s, 30s, 60s
+      const waitMs = 15000 * Math.pow(2, attempt);
+      onRetry?.(attempt + 1, waitMs);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw new Error("Unreachable");
+}
+
 export async function runDebate(
   apiKey: string,
   userMessages: Anthropic.MessageParam[],
   systemPrompt: string | undefined,
   config: RequestConfig,
-  onToolUse?: (name: string, input: Record<string, string>) => void
+  onToolUse?: (name: string, input: Record<string, string>) => void,
+  onStatus?: (msg: string) => void
 ): Promise<DebateResult> {
   const client = getClient(apiKey);
 
-  const advocateSystem =
+  const advocateSystemText =
     `You are the Advocate. Your job is to provide the best possible answer to the user's request.\n` +
     `You have tools: file ops (read/write/edit/delete/move/copy), directory (list/tree/info), search (grep), shell execution, and web (fetch/search).\n` +
+    `IMPORTANT: Be strategic with tool use. Read only the files you truly need. Use directory_tree or list_files first to understand structure, then read only key files. Do NOT read every file in a directory.\n` +
     `You will engage in a debate with a Critic who will challenge your answer.\n` +
     `When you and the Critic reach consensus, call the summon_judge tool with the final agreed answer.\n` +
     `Stay focused and constructive. Incorporate valid criticism to improve your answer.\n` +
     (systemPrompt ? `\nOriginal system context: ${systemPrompt}` : "");
 
+  const advocateSystem = cachedSystem(advocateSystemText);
   const advocateMessages: Anthropic.MessageParam[] = [...userMessages];
   const criticMessages: Anthropic.MessageParam[] = [];
 
-  // Get initial answer from advocate (with tool loop)
-  const initialAnswer = await callAdvocateWithTools(
-    client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse
+  const criticSystemText =
+    `You are the Critic. You receive an answer produced by another AI model.\n` +
+    `You do NOT know what the user originally asked. You can only see the answer.\n` +
+    `Your job is to find flaws, gaps, inaccuracies, or areas for improvement.\n` +
+    `Be CONCISE. List only the most important issues as bullet points. No filler.\n` +
+    `If the answer is already excellent, reply with just: "No issues found."`;
+  const criticSystem = cachedSystem(criticSystemText);
+
+  const retryHandler = (_attempt: number, waitMs: number) => {
+    onStatus?.(`⏳ Rate limited, waiting ${waitMs / 1000}s...`);
+  };
+
+  const initialAnswer = await withRetry(
+    () => callAdvocateWithTools(client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse),
+    3, retryHandler
   );
 
   if (typeof initialAnswer !== "string") {
@@ -51,30 +87,23 @@ export async function runDebate(
   let currentAnswer = initialAnswer;
 
   for (let round = 1; round <= config.max_rounds; round++) {
-    // --- Critic's turn ---
-    const criticSystem =
-      `You are the Critic. You receive an answer produced by another AI model.\n` +
-      `You do NOT know what the user originally asked. You can only see the answer.\n` +
-      `Your job is to find flaws, gaps, inaccuracies, or areas for improvement.\n` +
-      `Be specific and constructive. If the answer is already excellent, say so clearly.`;
-
     const criticPrompt =
-      `Here is the answer to review:\n\n${currentAnswer}\n\n` +
-      `Provide your critique. Be specific about what could be improved.`;
+      `Review this answer. List only concrete issues, max 5 bullet points:\n\n${currentAnswer}`;
 
     criticMessages.push({ role: "user", content: criticPrompt });
 
-    const criticResponse = await client.messages.create({
-      model: config.model_critic,
-      max_tokens: 4096,
-      system: criticSystem,
-      messages: criticMessages,
-    });
+    const criticism = await withRetry(
+      () => collectStreamedText(client, {
+        model: config.model_critic,
+        max_tokens: 2048,
+        system: criticSystem,
+        messages: criticMessages,
+      }),
+      3, retryHandler
+    );
 
-    const criticism = extractText(criticResponse);
     criticMessages.push({ role: "assistant", content: criticism });
 
-    // --- Advocate's turn ---
     const advocatePrompt =
       `A critic has reviewed your answer and provided this feedback:\n\n${criticism}\n\n` +
       `Revise your answer incorporating valid points, or defend your position if the criticism is unfounded.\n` +
@@ -82,8 +111,9 @@ export async function runDebate(
 
     advocateMessages.push({ role: "user", content: advocatePrompt });
 
-    const advocateAnswer = await callAdvocateWithTools(
-      client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse
+    const advocateAnswer = await withRetry(
+      () => callAdvocateWithTools(client, config.model_advocate, advocateSystem, allTools, advocateMessages, onToolUse),
+      3, retryHandler
     );
 
     if (typeof advocateAnswer !== "string") {
@@ -100,30 +130,58 @@ export async function runDebate(
   };
 }
 
-/**
- * Call the advocate model, handling file tool calls in a loop
- * until we get a text response or a summon_judge call.
- */
+async function collectStreamedText(
+  client: Anthropic,
+  params: {
+    model: string;
+    max_tokens: number;
+    system: Anthropic.TextBlockParam[];
+    messages: Anthropic.MessageParam[];
+  }
+): Promise<string> {
+  const stream = client.messages.stream(params);
+  const response = await stream.finalMessage();
+  return response.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+async function collectStreamedMessage(
+  client: Anthropic,
+  params: {
+    model: string;
+    max_tokens: number;
+    system: Anthropic.TextBlockParam[];
+    tools: Anthropic.Tool[];
+    messages: Anthropic.MessageParam[];
+  }
+): Promise<Anthropic.Message> {
+  const stream = client.messages.stream(params);
+  return stream.finalMessage();
+}
+
 async function callAdvocateWithTools(
   client: Anthropic,
   model: string,
-  system: string,
+  system: Anthropic.TextBlockParam[],
   tools: Anthropic.Tool[],
   messages: Anthropic.MessageParam[],
   onToolUse?: (name: string, input: Record<string, string>) => void
 ): Promise<string | { consensusAnswer: string; keyImprovements: string }> {
-  const maxToolRounds = 20;
+  const maxToolRounds = 10;
+  const TOOL_MAX_TOKENS = 4096;
+  const TEXT_MAX_TOKENS = 64000;
 
   for (let i = 0; i < maxToolRounds; i++) {
-    const response = await client.messages.create({
+    const response = await collectStreamedMessage(client, {
       model,
-      max_tokens: 8192,
+      max_tokens: i === 0 && messages.length <= 2 ? TEXT_MAX_TOKENS : TOOL_MAX_TOKENS,
       system,
       tools,
       messages,
     });
 
-    // Check for summon_judge
     const judgeCall = response.content.find(
       (b): b is Anthropic.ToolUseBlock =>
         b.type === "tool_use" && b.name === "summon_judge"
@@ -140,50 +198,60 @@ async function callAdvocateWithTools(
       };
     }
 
-    // Check for file tool calls
     const toolCalls = response.content.filter(
       (b): b is Anthropic.ToolUseBlock =>
         b.type === "tool_use" && b.name !== "summon_judge"
     );
 
     if (toolCalls.length === 0) {
-      // No tool calls — return text
-      const text = extractText(response);
+      if (response.stop_reason === "max_tokens") {
+        const retried = await collectStreamedMessage(client, {
+          model,
+          max_tokens: TEXT_MAX_TOKENS,
+          system,
+          tools,
+          messages,
+        });
+        const text = retried.content
+          .filter((b): b is Anthropic.TextBlock => b.type === "text")
+          .map((b) => b.text)
+          .join("\n");
+        messages.push({ role: "assistant", content: retried.content });
+        return text;
+      }
+
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
       messages.push({ role: "assistant", content: response.content });
       return text;
     }
 
-    // Execute file tools and feed results back
     messages.push({ role: "assistant", content: response.content });
 
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const call of toolCalls) {
-      const input = call.input as Record<string, string>;
-      onToolUse?.(call.name, input);
+    const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
+      toolCalls.map(async (call) => {
+        const input = call.input as Record<string, string>;
+        onToolUse?.(call.name, input);
 
-      let result: string;
-      try {
-        result = await executeTool(call.name, input);
-      } catch (err) {
-        result = `Error: ${err instanceof Error ? err.message : String(err)}`;
-      }
+        let result: string;
+        try {
+          result = await executeTool(call.name, input);
+        } catch (err) {
+          result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+        }
 
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: call.id,
-        content: result,
-      });
-    }
+        return {
+          type: "tool_result" as const,
+          tool_use_id: call.id,
+          content: result,
+        };
+      })
+    );
 
     messages.push({ role: "user", content: toolResults });
   }
 
   return "Max tool rounds exceeded.";
-}
-
-function extractText(response: Anthropic.Message): string {
-  return response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
 }

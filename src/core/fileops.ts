@@ -6,7 +6,18 @@ import https from "https";
 
 const execAsync = promisify(exec);
 
-/** Resolve and validate that a path stays within the working directory */
+const IGNORED_DIRS = new Set([
+  "node_modules", ".git", "dist", ".next", ".nuxt", "__pycache__",
+  ".venv", "venv", ".tox", "coverage", ".nyc_output", ".cache",
+  "build", "out", ".turbo", ".svelte-kit",
+]);
+
+const MAX_TOOL_OUTPUT = 20000; // chars — ~5k tokens safe limit
+
+function truncateOutput(output: string): string {
+  if (output.length <= MAX_TOOL_OUTPUT) return output;
+  return output.slice(0, MAX_TOOL_OUTPUT) + `\n... (truncated, ${output.length} chars total)`;
+}
 function safePath(relativePath: string): string {
   const resolved = path.resolve(process.cwd(), relativePath);
   const cwd = process.cwd();
@@ -94,13 +105,18 @@ export async function listFiles(dirPath: string): Promise<string> {
 export async function directoryTree(dirPath: string, maxDepth: number = 3): Promise<string> {
   const resolved = safePath(dirPath);
   const lines: string[] = [];
+  const MAX_ENTRIES = 500;
 
   async function walk(dir: string, prefix: string, depth: number) {
-    if (depth > maxDepth) return;
+    if (depth > maxDepth || lines.length >= MAX_ENTRIES) return;
     const entries = await fs.readdir(dir, { withFileTypes: true });
-    const filtered = entries.filter(e => !e.name.startsWith(".") && e.name !== "node_modules");
+    const filtered = entries.filter(e => !e.name.startsWith(".") && !IGNORED_DIRS.has(e.name));
 
     for (let i = 0; i < filtered.length; i++) {
+      if (lines.length >= MAX_ENTRIES) {
+        lines.push("... (truncated)");
+        return;
+      }
       const entry = filtered[i];
       const isLast = i === filtered.length - 1;
       const connector = isLast ? "└── " : "├── ";
@@ -250,34 +266,51 @@ export async function executeTool(
   const n = (key: string, def: number) =>
     input[key] !== undefined ? Number(input[key]) : def;
 
+  let result: string;
+
   switch (name) {
     case "read_file":
-      return readFile(s("path"));
+      result = await readFile(s("path"));
+      break;
     case "write_file":
-      return writeFile(s("path"), s("content"));
+      result = await writeFile(s("path"), s("content"));
+      break;
     case "edit_file":
-      return editFile(s("path"), s("old_str"), s("new_str"));
+      result = await editFile(s("path"), s("old_str"), s("new_str"));
+      break;
     case "delete_file":
-      return deleteFile(s("path"));
+      result = await deleteFile(s("path"));
+      break;
     case "move_file":
-      return moveFile(s("source"), s("destination"));
+      result = await moveFile(s("source"), s("destination"));
+      break;
     case "copy_file":
-      return copyFile(s("source"), s("destination"));
+      result = await copyFile(s("source"), s("destination"));
+      break;
     case "list_files":
-      return listFiles(s("path"));
+      result = await listFiles(s("path"));
+      break;
     case "directory_tree":
-      return directoryTree(s("path") ?? ".", n("max_depth", 3));
+      result = await directoryTree(s("path") ?? ".", n("max_depth", 3));
+      break;
     case "grep_search":
-      return grepSearch(s("pattern"), s("path") ?? ".", s("include") ?? undefined);
+      result = await grepSearch(s("pattern"), s("path") ?? ".", s("include") ?? undefined);
+      break;
     case "file_info":
-      return fileInfo(s("path"));
+      result = await fileInfo(s("path"));
+      break;
     case "run_shell":
-      return runShell(s("command"), n("timeout", 30000));
+      result = await runShell(s("command"), n("timeout", 30000));
+      break;
     case "web_fetch":
-      return webFetch(s("url"));
+      result = await webFetch(s("url"));
+      break;
     case "web_search":
-      return webSearch(s("query"));
+      result = await webSearch(s("query"));
+      break;
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+
+  return truncateOutput(result);
 }

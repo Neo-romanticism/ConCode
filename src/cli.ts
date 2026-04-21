@@ -15,8 +15,10 @@ const args = process.argv.slice(2);
 if (args[0] === "--set-key" && args[1]) {
   const dir = path.join(os.homedir(), ".concode");
   const envPath = path.join(dir, ".env");
+  // strip "ANTHROPIC_API_KEY=" prefix if user pasted the whole thing
+  const key = args[1].replace(/^ANTHROPIC_API_KEY=/i, "");
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(envPath, `ANTHROPIC_API_KEY=${args[1]}\n`);
+  fs.writeFileSync(envPath, `ANTHROPIC_API_KEY=${key}\n`);
   console.log(`✅ Key saved to ${envPath}`);
   process.exit(0);
 }
@@ -25,6 +27,10 @@ import readline from "readline";
 import { RequestConfigSchema } from "./config.js";
 import { runDebate } from "./core/debate.js";
 import { judgeStream } from "./core/judge.js";
+import { getClient } from "./utils/anthropic.js";
+import { allTools } from "./core/tools.js";
+import { executeTool } from "./core/fileops.js";
+import Anthropic from "@anthropic-ai/sdk";
 
 const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
 if (!apiKey) {
@@ -51,6 +57,7 @@ console.log(`   Advocate: ${config.model_advocate}`);
 console.log(`   Critic:   ${config.model_critic}`);
 console.log(`   Judge:    ${config.model_judge}`);
 console.log(`   Rounds:   max ${config.max_rounds}`);
+console.log('   Prefix with ! for fast mode (skip debate)');
 console.log('   Type "exit" to quit.\n');
 
 function prompt() {
@@ -63,23 +70,91 @@ function prompt() {
     }
 
     try {
-      process.stdout.write("\n⏳ Debating...\n");
+      // Fast mode: skip debate, direct response
+      if (trimmed.startsWith("!")) {
+        const query = trimmed.slice(1).trim();
+        if (!query) { prompt(); return; }
 
-      const userMessages = [{ role: "user" as const, content: trimmed }];
-      const debateResult = await runDebate(apiKey, userMessages, undefined, config, (name, input) => {
-        const detail = input.path ?? input.command ?? input.query ?? input.url ?? input.pattern ?? "";
-        process.stdout.write(`  🔧 ${name}${detail ? `: ${detail}` : ""}\n`);
-      });
+        process.stdout.write("\n⚡ Fast mode\n\n");
+        const client = getClient(apiKey);
+        const messages: Anthropic.MessageParam[] = [{ role: "user", content: query }];
 
-      process.stdout.write(`✅ Consensus after ${debateResult.rounds} round(s)\n\n`);
+        // Tool loop for fast mode
+        for (let i = 0; i < 20; i++) {
+          const isFirst = i === 0;
+          const stream = client.messages.stream({
+            model: config.model_advocate,
+            max_tokens: isFirst ? 64000 : 4096,
+            system: "You are a helpful coding assistant. You have file, shell, search, and web tools available.",
+            tools: allTools,
+            messages,
+          });
+          const response = await stream.finalMessage();
 
-      const chunks = judgeStream(apiKey, config.model_judge, userMessages, undefined, debateResult);
+          const toolCalls = response.content.filter(
+            (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
+          );
 
-      for await (const text of chunks) {
-        process.stdout.write(text);
+          if (toolCalls.length === 0) {
+            // If truncated by low token limit, retry with full budget
+            if (response.stop_reason === "max_tokens") {
+              const retry = client.messages.stream({
+                model: config.model_advocate,
+                max_tokens: 64000,
+                system: "You are a helpful coding assistant. You have file, shell, search, and web tools available.",
+                tools: allTools,
+                messages,
+              });
+              const retried = await retry.finalMessage();
+              for (const block of retried.content) {
+                if (block.type === "text") process.stdout.write(block.text);
+              }
+            } else {
+              for (const block of response.content) {
+                if (block.type === "text") process.stdout.write(block.text);
+              }
+            }
+            break;
+          }
+
+          messages.push({ role: "assistant", content: response.content });
+          const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
+            toolCalls.map(async (call) => {
+              const input = call.input as Record<string, string>;
+              const detail = input.path ?? input.command ?? input.query ?? input.url ?? input.pattern ?? "";
+              process.stdout.write(`  🔧 ${call.name}${detail ? `: ${detail}` : ""}\n`);
+              let result: string;
+              try { result = await executeTool(call.name, input); }
+              catch (err) { result = `Error: ${err instanceof Error ? err.message : String(err)}`; }
+              return { type: "tool_result" as const, tool_use_id: call.id, content: result };
+            })
+          );
+          messages.push({ role: "user", content: toolResults });
+        }
+
+        process.stdout.write("\n\n");
+      } else {
+        // Debate mode
+        process.stdout.write("\n⏳ Debating...\n");
+
+        const userMessages = [{ role: "user" as const, content: trimmed }];
+        const debateResult = await runDebate(apiKey, userMessages, undefined, config, (name, input) => {
+          const detail = input.path ?? input.command ?? input.query ?? input.url ?? input.pattern ?? "";
+          process.stdout.write(`  🔧 ${name}${detail ? `: ${detail}` : ""}\n`);
+        }, (status) => {
+          process.stdout.write(`  ${status}\n`);
+        });
+
+        process.stdout.write(`✅ Consensus after ${debateResult.rounds} round(s)\n\n`);
+
+        const chunks = judgeStream(apiKey, config.model_judge, userMessages, undefined, debateResult);
+
+        for await (const text of chunks) {
+          process.stdout.write(text);
+        }
+
+        process.stdout.write("\n\n");
       }
-
-      process.stdout.write("\n\n");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`\n❌ Error: ${message}\n`);
