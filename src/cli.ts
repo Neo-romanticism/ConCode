@@ -1,5 +1,26 @@
 #!/usr/bin/env node
 import "dotenv/config";
+import dotenv from "dotenv";
+import path from "path";
+import os from "os";
+import fs from "fs";
+
+// 홈 디렉토리 fallback
+if (!process.env.ANTHROPIC_API_KEY) {
+  dotenv.config({ path: path.join(os.homedir(), ".concode", ".env") });
+}
+
+// --set-key: 키 저장하고 종료
+const args = process.argv.slice(2);
+if (args[0] === "--set-key" && args[1]) {
+  const dir = path.join(os.homedir(), ".concode");
+  const envPath = path.join(dir, ".env");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(envPath, `ANTHROPIC_API_KEY=${args[1]}\n`);
+  console.log(`✅ Key saved to ${envPath}`);
+  process.exit(0);
+}
+
 import readline from "readline";
 import { RequestConfigSchema } from "./config.js";
 import { runDebate } from "./core/debate.js";
@@ -7,7 +28,9 @@ import { judgeStream } from "./core/judge.js";
 
 const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
 if (!apiKey) {
-  console.error("❌ ANTHROPIC_API_KEY not found. Create a .env file with your key.");
+  console.error("❌ ANTHROPIC_API_KEY not found.");
+  console.error("   Set it once: concode --set-key sk-ant-...");
+  console.error("   Or create .env in current folder or ~/.concode/.env");
   process.exit(1);
 }
 
