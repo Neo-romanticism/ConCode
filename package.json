@@ -1,7 +1,7 @@
 {
   "name": "concode",
-  "version": "0.1.0",
-  "description": "Debate-driven AI proxy server — two models argue, a judge decides, you get better answers.",
+  "version": "0.2.0",
+  "description": "Customizable AI agent teams as an API — define agents, workflows, and call them via a single endpoint.",
   "main": "dist/index.js",
   "bin": {
     "concode": "dist/cli.js"

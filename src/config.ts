@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+// Legacy config — backward compatible with existing debate mode
 export const RequestConfigSchema = z.object({
   model_advocate: z.string().default("claude-sonnet-4-6"),
   model_critic: z.string().default("claude-sonnet-4-6"),

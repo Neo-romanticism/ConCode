@@ -4,6 +4,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { RequestConfigSchema } from "../config.js";
 import { runDebate } from "../core/debate.js";
 import { judgeStream } from "../core/judge.js";
+import { orchestrateStream } from "../core/orchestrator.js";
+import { getTeam } from "../store/teams.js";
 import { streamSSE } from "../utils/stream.js";
 
 const router = Router();
@@ -17,19 +19,22 @@ const ChatRequestSchema = z.object({
   model: z.string().optional(),
   messages: z.array(MessageSchema).min(1),
   stream: z.boolean().default(true),
-  // concode-specific config
+  // concode-specific config (legacy)
   concode: RequestConfigSchema.optional(),
+  // Team-based execution
+  team: z.string().optional(), // team ID or preset name
 });
 
 /**
  * POST /v1/chat/completions
  *
- * OpenAI-compatible endpoint. The API key is passed via Authorization header.
- * concode-specific settings go in the `concode` field of the request body.
+ * OpenAI-compatible endpoint.
+ *
+ * - Without `team`: uses legacy debate mode (backward compatible)
+ * - With `team`: uses the specified team's workflow
  */
 router.post("/v1/chat/completions", async (req: Request, res: Response) => {
   try {
-    // API key: header takes priority, falls back to .env
     const authHeader = req.headers.authorization;
     const apiKey = authHeader?.startsWith("Bearer ")
       ? authHeader.slice(7)
@@ -42,15 +47,13 @@ router.post("/v1/chat/completions", async (req: Request, res: Response) => {
       return;
     }
 
-    // Parse and validate request body
     const parsed = ChatRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "Invalid request", details: parsed.error.issues });
       return;
     }
 
-    const { messages, concode } = parsed.data;
-    const config = concode ?? RequestConfigSchema.parse({});
+    const { messages, concode, team: teamId } = parsed.data;
 
     // Separate system prompt from messages
     let systemPrompt: string | undefined;
@@ -69,10 +72,30 @@ router.post("/v1/chat/completions", async (req: Request, res: Response) => {
       return;
     }
 
-    // Run the debate
+    // ─── Team-based execution ───
+    if (teamId) {
+      const team = await getTeam(teamId);
+      if (!team) {
+        res.status(404).json({ error: `Team "${teamId}" not found. Use GET /v1/teams to list available teams.` });
+        return;
+      }
+
+      const chunks = orchestrateStream(apiKey, team, userMessages, systemPrompt, {
+        onStep: (step, agent, action) => {
+          // Could be used for debug headers in the future
+        },
+      });
+
+      const model = team.agents[team.agents.length - 1]?.model || "claude-sonnet-4-6";
+      await streamSSE(res, model, chunks);
+      return;
+    }
+
+    // ─── Legacy debate mode (backward compatible) ───
+    const config = concode ?? RequestConfigSchema.parse({});
+
     const debateResult = await runDebate(apiKey, userMessages, systemPrompt, config);
 
-    // Stream the judge's final response
     const chunks = judgeStream(
       apiKey,
       config.model_judge,
